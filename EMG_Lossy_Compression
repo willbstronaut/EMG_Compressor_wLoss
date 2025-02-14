@@ -1,0 +1,137 @@
+##by William Silva##
+###lossy compression###
+
+import numpy as np
+import pandas as pd
+import pywt
+import heapq
+import matplotlib.pyplot as plt
+from sklearn.cluster import KMeans
+
+class EMGSignalCompressor:
+    
+    def __init__(self, wavelet='db4', decomp_level=3, num_clusters=16):
+        self.wavelet = wavelet
+        self.decomp_level = decomp_level
+        self.num_clusters = num_clusters
+
+    def load_signals(self, num_electrodes=7, num_segments=150):
+        matrices = []
+        for i in range(num_electrodes):
+            file_name = f"electrode_{i+1}.csv"
+            data = pd.read_csv(file_name, header=None)
+            matrix = data.values.reshape(-1, num_segments)
+            matrices.append(matrix)
+        
+        self.combined_matrix = np.array(matrices)
+        return self.combined_matrix
+
+    def normalize_signal(self, signal):
+        return (signal - np.min(signal)) / (np.max(signal) - np.min(signal))
+
+    def wavelet_transform(self, signal):
+        transformed_signal = np.zeros_like(signal)
+        coeffs_list = []
+        
+        for i in range(signal.shape[0]):
+            for j in range(signal.shape[1]):
+                coeffs = pywt.wavedec(signal[i, j], self.wavelet, level=self.decomp_level)
+                coeffs_list.append(coeffs)
+                transformed_signal[i, j] = pywt.waverec(coeffs, self.wavelet)
+        return transformed_signal, coeffs_list
+
+    def vector_quantization(self, signal):
+        flattened_signal = signal.flatten().reshape(-1, 1)
+        kmeans = KMeans(n_clusters=self.num_clusters, random_state=42)
+        kmeans.fit(flattened_signal)
+        codebook = kmeans.cluster_centers_.flatten()
+        labels = kmeans.labels_.reshape(signal.shape)
+        quantized_signal = codebook[labels]
+        return quantized_signal, codebook, labels
+
+    def adaptive_huffman_encoding(self, signal):
+        quantization_levels = 256
+        quantized_signal = np.round(signal * (quantization_levels - 1)).astype(int)
+        unique, counts = np.unique(quantized_signal, return_counts=True)
+        probabilities = counts / len(quantized_signal)
+        heap = [[p, [sym, ""]] for sym, p in zip(unique, probabilities)]
+        heapq.heapify(heap)
+        
+        while len(heap) > 1:
+            lo = heapq.heappop(heap)
+            hi = heapq.heappop(heap)
+            for pair in lo[1:]:
+                pair[1] = '0' + pair[1]
+            for pair in hi[1:]:
+                pair[1] = '1' + pair[1]
+            heapq.heappush(heap, [lo[0] + hi[0]] + lo[1:] + hi[1:])
+        
+        codes = {symbol: code for symbol, code in heap[0][1:]}
+        encoded_signal = ''.join(codes[sym] for sym in quantized_signal)
+        return encoded_signal, codes, quantized_signal
+
+    def huffman_decoding(self, encoded_signal, codes, signal_length):
+        reverse_codes = {code: symbol for symbol, code in codes.items()}
+        decoded_signal = []
+        current_code = ""
+        for bit in encoded_signal:
+            current_code += bit
+            if current_code in reverse_codes:
+                decoded_signal.append(reverse_codes[current_code])
+                current_code = ""
+        
+        if not decoded_signal:
+            decoded_signal = [0] * signal_length
+        else:
+            while len(decoded_signal) < signal_length:
+                decoded_signal.append(decoded_signal[-1] if decoded_signal else 0)
+        
+        decoded_signal = decoded_signal[:signal_length]
+        return np.array(decoded_signal) / (256 - 1)
+
+    def compress_decompress(self):
+        signal = self.load_signals()
+        normalized_signal = self.normalize_signal(signal)
+        dwt_signal, _ = self.wavelet_transform(normalized_signal)
+        vq_signal, codebook, labels = self.vector_quantization(dwt_signal)
+        num_electrodes, num_segments, num_samples = vq_signal.shape
+        encoded_signals = np.zeros((num_electrodes, num_segments), dtype=object)
+        huffman_codes = np.zeros((num_electrodes, num_segments), dtype=object)
+        
+        for i in range(num_electrodes):
+            for j in range(num_segments):
+                encoded_seg, seg_codes, _ = self.adaptive_huffman_encoding(vq_signal[i, j])
+                encoded_signals[i, j] = encoded_seg
+                huffman_codes[i, j] = seg_codes
+        
+        decoded_signals = np.zeros_like(vq_signal)
+        for i in range(num_electrodes):
+            for j in range(num_segments):
+                decoded_signals[i, j] = self.huffman_decoding(
+                    encoded_signals[i, j], 
+                    huffman_codes[i, j], 
+                    num_samples
+                )
+        
+        reconstructed_signal = codebook[labels]
+        original_size = normalized_signal.nbytes
+        compressed_size = sum(len(seg) for seg in encoded_signals.flatten()) / 8
+        compression_ratio = original_size / compressed_size
+        mse = np.mean((normalized_signal - reconstructed_signal)**2)
+        print(f"Compression Ratio: {compression_ratio:.10f}")
+        print(f"Mean Squared Error: {mse:.10f}")
+        return normalized_signal, reconstructed_signal
+
+# Visualização
+compressor = EMGSignalCompressor()
+original, reconstructed = compressor.compress_decompress()
+
+plt.figure(figsize=(15,5))
+plt.subplot(2,1,1)
+plt.title('Original Signal')
+plt.plot(original[0,0])
+plt.subplot(2,1,2)
+plt.title('Reconstructed Signal')
+plt.plot(reconstructed[0,0])
+plt.tight_layout()
+plt.show()
